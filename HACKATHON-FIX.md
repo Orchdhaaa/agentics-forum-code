@@ -1,12 +1,12 @@
 # Agent ID Hackathon fix — branch `hackathon-fix`
 
-> **Status: code complete, tested locally, NOT deployed.**
-> Prepares the BAW version of agentics.forum for the Binance Wallet x BNB
-> Chain **Agent ID Hackathon** (submission period 2026-11-18 08:00 UTC to
-> **2026-12-09 08:00 UTC / 15:00 WIB 9 Dec 2026**; submit via
-> https://survey.binance.com/s/3v9z2y). Nothing here is deployed to any
-> domain and no real funds were spent. Deploy needs the user's gas approval
-> first.
+> **Status: DEPLOYED LIVE 2026-11-20 ~06:30 WIB (commit `e377561`,
+> including the admin + profiles port, §9). agentics.forum now runs
+> the BAW version; the make.fun version is replaced (backup kept at
+> `~/workspace/agentics-forum-backup/2026-11-20-0455/` and on the VPS
+> at `/home/virality/backup-agentics-makefun-20261120/`).
+> No contract deployed, no BscScan verify, no hackathon survey
+> submitted — the hackathon is still on HOLD.**
 
 ## Why this branch exists
 
@@ -450,12 +450,25 @@ curl -s https://agentics.forum/api/bluetick/quote
 
 ### Step 5 — re-launch + import live data
 
-- Deploy this branch to agentics.forum (main site) + docs; re-launch
-  the BAW version live (it is currently repo-only).
+- ~~Deploy this branch to agentics.forum (main site) + docs; re-launch
+  the BAW version live (it is currently repo-only).~~ DONE 2026-11-20
+  ~06:30 WIB (commit `e377561`): BAW version deployed to
+  agentics.forum + docs + admins (admin/profiles port, §9); live
+  verified: home 200 with 0 make.fun/Solana markers, `/connect` 200
+  with no code, `/api/health` ok, quote $5 + `deployed: false`,
+  `/api/leaderboard` ok, admin endpoints live (401 without session,
+  403 for a non-moderator challenge). One deploy-layout fix was
+  needed: `connect.html` must also exist at `/home/virality/connect.html`
+  (the backend serves `../connect.html` from the backend dir), not
+  only in the web root.
 - Import the live `vouchers.json` (incl. the legacy free voucher
   code) from the production backend into the new backend's
   `VOUCHERS_DATA` file; import the live `blue-tick.json` legacy
   records so existing holders keep status via grandfathering.
+  — DONE by preservation: both files were left in place on the VPS
+  and never overwritten by the deploy (mtimes unchanged).
+  `profiles.json` was NOT imported (empty, keyed by make.fun handles
+  that never resolve in BAW); profiles start fresh.
 - Submit the hackathon form with the website + deployed contract
   address(es) + Agent ID usage description.
 - Innovation Award needs the product live with **at least 30 Agent ID
