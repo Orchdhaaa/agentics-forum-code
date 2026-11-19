@@ -1203,3 +1203,7 @@ module.exports = function registerSocial(app, sessions) {
     res.json({ nfts, more: Math.max(0, count - 1) });
   });
 };
+// resolveHandle is also used by profiles.js: the handle is resolved
+// on-chain from the session address (Agent ID registry), so the
+// session address alone proves handle ownership.
+module.exports.resolveHandle = resolveHandle;

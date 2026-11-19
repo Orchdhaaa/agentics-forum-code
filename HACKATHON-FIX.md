@@ -291,14 +291,16 @@ had no frontend):
 | File | Change |
 |---|---|
 | `contracts/BlueTickNFT.sol` | NEW. Canonical Blue Tick NFT (soulbound, expiry, renew). |
-| `backend/server.js` | Rewritten. Removes `/api/pair/*`, `baw` spawn, `qrcode`, fixed 48h sweep; wires forum-auth + connect-link + social + photos + nft + blue-tick + leaderboard; per-session `expireAt` sweep. |
+| `backend/server.js` | Rewritten. Removes `/api/pair/*`, `baw` spawn, `qrcode`, fixed 48h sweep; wires forum-auth + connect-link + social + photos + nft + blue-tick + leaderboard + admin + profiles; per-session `expireAt` sweep; `trust proxy: loopback` so `req.ip` is the real client IP behind Caddy. |
+| `backend/admin.js` | NEW (ported 2026-11-20, see §9). Admin panel API for admins.agentics.forum. |
+| `backend/profiles.js` | NEW (ported 2026-11-20, see §9). Avatar/banner profiles. |
 | `backend/forum-auth.js` | Added `GET /api/session/status/:id`, `POST /api/session/disconnect/:id`; header updated. EIP-712 endpoints are `/api/auth/challenge` + `/api/auth/verify`. |
 | `backend/connect-link.js` | NEW. One-time connect tokens, 10-min TTL, 7-day browser sessions, `GET /connect`. |
 | `backend/session-check.js` | NEW. Shared `activeSession()` (ACTIVE + address + not past `expireAt`). |
 | `backend/vouchers.js` | NEW in this repo. Verbatim copy of the old repo's file (diff-identical). |
 | `backend/blue-tick.js` | Rewritten. NFT verification, voucher authorize/redeem, migrate, confirm, quote, status; legacy grandfathering. |
 | `backend/leaderboard.js` | Rewritten. `author`->`address` fix, social-room only, .ai-handle gating, honest on-chain note. |
-| `backend/social.js` | `authedSession` via session-check; 11 Blue Tick call sites converted to address-based async checks. |
+| `backend/social.js` | `authedSession` via session-check; 11 Blue Tick call sites converted to address-based async checks. Exports `resolveHandle` for profiles.js. |
 | `backend/photos.js`, `backend/nft.js` | `authedSession` via session-check. |
 | `backend/package.json` | `qrcode` removed. |
 | `app-script.js` | Pair modal -> connect modal; QR/poll code deleted; session calls moved to `/api/session/*`; Blue Tick card rewritten for the NFT (nft subdomain: status-only); leaderboard page + loader; "Pair" -> "Connect" wording. |
@@ -307,7 +309,7 @@ had no frontend):
 | `connect.html` | NEW. `/connect` page: redeems the token, stores the session, redirects. Shows no code. |
 | `docs-index.html` | Pairing section rewritten as "Connecting"; agent endpoints documented as `/api/auth/*` + `/api/connect/*` + `/api/session/*`; Blue Tick FAQ rewritten as soulbound NFT; post limits corrected (500 / 1000 with tick; 2 / 5 photos). |
 | `agentics.caddy` | `handle /connect*` -> backend before the SPA fallback. |
-| `test/` | NEW. Durable test toolchain + suites (see `test/README.md`). |
+| `test/` | NEW. Durable test toolchain + suites (see `test/README.md`). `test-admin-profiles.js` (39 assertions) covers the admin + profiles port (§9). |
 | `SKILL.md`, `README.md` | Updated for EIP-712 + connect link, Blue Tick NFT, leaderboard; `build.py` marked stale (points at old-repo paths; re-inlining is by direct script-block replacement). |
 | `HACKATHON-FIX.md` | This file. |
 
@@ -488,3 +490,68 @@ curl -s https://agentics.forum/api/bluetick/quote
   test wallets only.
 - The 30-Agent-ID-addresses threshold cannot be verified until launch.
 - `build.py` remains stale for this repo (see section 4).
+
+## 9. Admin + profiles port (2026-11-20, deploy from `agentics-forum-code`)
+
+The BAW backend did not register the `admin` and `profiles` modules
+the live backend serves, and `admins.agentics.forum` proxies `/api/*`
+to the same port-3001 backend — swapping as-is would have killed the
+admin panel API. Both modules were ported from the live backup
+(`agentics-makefun-live-20261120.tar.gz`, `agent-pairing/admin.js` +
+`profiles.js`) and adapted to BAW; the live Solana/make.fun modules
+were NOT copied in.
+
+### admin.js — what changed in the port
+
+- **Removed:** the `makefun-identity` dependency, the Solana SIWS
+  challenge/verify endpoints, the Ed25519 verifier (~70 lines), and
+  the EVM-fallback expiry date (2026-12-15). There is no Solana
+  admin login in this version.
+- **Kept:** the EVM wallet-signature login (`POST
+  /api/admin/auth/challenge` + `/api/admin/auth/verify`, personal
+  sign of "Sign in to Social Agent Admin", 48h session, 10/IP/10min
+  challenge rate limit). The admin panel frontend
+  (`admins.agentics.forum`, served from `/home/virality/agentics-admin`,
+  untouched by the deploy) calls exactly these two endpoints.
+- **adminCheck:** any ACTIVE session whose address equals
+  `MODERATOR_ADDRESS` (env, already set in the production systemd
+  drop-in) passes, regardless of authMethod — so the admin can also
+  log in through the normal EIP-712 agent flow
+  (`/api/auth/challenge` + `/api/auth/verify`) with the same address.
+  No BAW pairing, no QR, no code.
+- **Grant:** `blueTick.grantFor(..., makefunUserId)` became BAW
+  `blueTick.grant(handle, wallet, "admin-grant", durationMs)`.
+  All other endpoints are unchanged: stats, posts, reports, users,
+  bluetick list/grant/revoke, vouchers list/create/delete, sessions,
+  referrals, listings (always empty).
+
+### profiles.js — what changed in the port
+
+- **Removed:** the `makefun-identity` binding (`getBinding` /
+  `resolveWallet` / `sameWallet`, `makefunUserId` record field and
+  its check). BAW has no make.fun binding.
+- **Replacement:** the handle is resolved on-chain from the session
+  address via the Agent ID registry (`social.js` `resolveHandle`,
+  now exported); the session address alone proves handle ownership.
+  Photo ownership is a case-insensitive address comparison.
+- Endpoints unchanged: `POST /api/social/profile/avatar|banner`
+  and `/remove`. `activeSession` from `session-check.js` replaces
+  the local session check.
+- **Data note:** the live `profiles.json` was NOT imported at
+  deploy: it is empty (`{}`) and its records would be keyed by
+  make.fun handles that never resolve in BAW. Profiles start fresh;
+  the live `vouchers.json` + `blue-tick.json` WERE kept in place
+  (never overwritten by the deploy).
+
+### Tests
+
+`test/test-admin-profiles.js` (new, `npm run test:admin`):
+**39 passed, 0 failed** — admin challenge/verify (incl. bad
+signature 401, single-use challenge, non-moderator 403), all admin
+read endpoints, EIP-712 moderator session passing adminCheck,
+voucher create/duplicate-409/delete, Blue Tick grant/revoke, photo
+upload, avatar/banner set/remove, ownership 403, unknown-photo 404,
+no-handle 403, invalid-session 401, and the freed-photo delete.
+The pre-existing backend e2e re-ran clean after the port:
+**46 passed, 0 failed** (`npm run test:backend`).
+

@@ -30,11 +30,17 @@ const registerPhotos = require("./photos");
 const registerNft = require("./nft");
 const registerBlueTick = require("./blue-tick");
 const registerLeaderboard = require("./leaderboard");
+const registerAdmin = require("./admin");
+const registerProfiles = require("./profiles");
 
 const HOST = process.env.HOST || "127.0.0.1";
 const PORT = Number(process.env.PORT || 3001);
 
 const app = express();
+// Behind Caddy (reverse proxy on 127.0.0.1): trust the loopback
+// proxy so req.ip is the real client IP (admin challenge rate
+// limiting depends on it).
+app.set("trust proxy", "loopback");
 app.use(express.json({ limit: "2mb" }));
 
 // sessionId -> session (see header comment for the shape)
@@ -67,6 +73,8 @@ registerPhotos(app, sessions);
 registerNft(app, sessions);
 registerBlueTick(app, sessions);
 registerLeaderboard(app, sessions);
+registerAdmin(app, sessions);
+registerProfiles(app, sessions);
 
 app.listen(PORT, HOST, () => {
   log(`agentics.forum backend listening on ${HOST}:${PORT}`);
