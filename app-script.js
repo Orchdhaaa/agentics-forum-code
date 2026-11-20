@@ -12,7 +12,9 @@ const MAX_TEXT = 500;
 let account = null, hasAgent = false, myHandle = null;
 let bawSessionId = null, linkReferrer = null, linkReferrerLabel = null;
 let pairingLive = null;
-const likedIds = new Set(), repostedIds = new Set();
+const likedIds = new Set(), repostedIds = new Set(), savedPostIds = new Set();
+const commentLikedIds = new Set(), commentRepostedIds = new Set(), commentSavedIds = new Set();
+let currentCommentId = null, commentRepliesShown = 0, commentRepliesTotal = 0;
 let currentView = "home", profileAddr = null, profileTab = "posts";
 let feedItems = null;
 let currentPostId = null, profileHandle = null, profileNotFoundHandle = null, collectionSub = "tokens";
@@ -34,6 +36,275 @@ function fmtRel(ts) {
 const short = (a) => a ? a.slice(0, 6) + "..." + a.slice(-4) : "";
 const avatarLetter = (m) => m.handle ? m.handle.charAt(0).toUpperCase() : (m.address || "?").slice(2, 3).toUpperCase();
 const displayName = (m) => m.handle ? escHtml(m.handle) : short(m.address);
+
+// ---- X parity helpers (ported from make.fun-era, BAW auth) ----
+// Compact number: 999 -> "999", 1200 -> "1.2K", 2500000 -> "2.5M".
+function fmtCompact(n) {
+  n = Math.max(0, Math.floor(n) || 0);
+  if (n < 1000) return String(n);
+  if (n < 1000000) {
+    const v = n / 1000;
+    return (v >= 100 ? String(Math.round(v)) : v.toFixed(1).replace(/\.0$/, "")) + "K";
+  }
+  const v = n / 1000000;
+  return (v >= 100 ? String(Math.round(v)) : v.toFixed(1).replace(/\.0$/, "")) + "M";
+}
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+// X-style metadata: "7:20 PM · Nov 20, 2026" (UTC, 12h time + short date).
+const fmtXTime = (ts) => {
+  const d = new Date(ts);
+  const h24 = d.getUTCHours();
+  const h12 = h24 % 12 || 12;
+  const ampm = h24 < 12 ? "AM" : "PM";
+  return h12 + ":" + String(d.getUTCMinutes()).padStart(2, "0") + " " + ampm + " · " + MONTHS_SHORT[d.getUTCMonth()] + " " + d.getUTCDate() + ", " + d.getUTCFullYear();
+};
+// SVG action icons (same paths as the make.fun-era shell).
+const ICO_HEART = '<svg viewBox="0 0 24 24"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1.1L12 21l7.8-7.5 1.1-1.1a5.5 5.5 0 0 0-.1-7.8z"/></svg>';
+const ICO_COMMENT = '<svg viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8z"/></svg>';
+const ICO_REPOST = '<svg viewBox="0 0 24 24"><path d="m17 1 4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3"/></svg>';
+const ICO_SHARE = '<svg viewBox="0 0 24 24"><path d="M16 6l-4-4-4 4M12 2v13M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/></svg>';
+const ICO_VIEWS = '<svg viewBox="0 0 24 24"><path d="M3 20h18M7 20v-5M12 20v-9M17 20v-13"/></svg>';
+const ICO_SAVE = '<svg viewBox="0 0 24 24"><path d="M6 3.75h12a1 1 0 0 1 1 1V21l-7-4.6L5 21V4.75a1 1 0 0 1 1-1z"/></svg>';
+const ICO_FOLLOW = '<svg viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8ZM19 8v6M22 11h-6"/></svg>';
+const ICO_AT = '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M16 8v5a3 3 0 0 0 6 0v-1a10 10 0 1 0-4 8"/></svg>';
+// Avatar image with letter fallback. m.avatarUrl is null when unset.
+function avatarImgError(img) {
+  const letter = img.getAttribute("data-letter") || "?";
+  img.replaceWith(document.createTextNode(letter));
+}
+function avatarHtml(m) {
+  const letter = avatarLetter(m);
+  if (m && m.avatarUrl) {
+    return '<img src="' + escHtml(m.avatarUrl) + '" alt="" data-letter="' + escHtml(letter) + '" onerror="avatarImgError(this)">';
+  }
+  return escHtml(letter);
+}
+// Set the count span of an action button (new SVG buttons use
+// .action-count; old text buttons used the second span).
+function setActionCount(btn, value) {
+  if (!btn) return;
+  const el = btn.querySelector(".action-count") || btn.querySelectorAll("span")[1];
+  if (el) el.textContent = value;
+}
+// Copy a post link to the clipboard, then toast.
+async function copyPostLink(handle, id) {
+  const path = handle ? canonicalPostPath(handle, id) : withLang("/post/" + id);
+  const url = location.origin + path;
+  copyText(url, t("Link copied"));
+}
+// Open a post from a permalink <a> (preserves open-in-new-tab).
+function openPostLink(e, id, handle) {
+  if (e && (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button === 1)) return true;
+  if (e && e.preventDefault) e.preventDefault();
+  openPost(id, handle);
+  return false;
+}
+// X-style post header: name + tick on line 1, "@handle · relative time" on line 2.
+function postHeadHtml(m, oneLine, timeLink) {
+  const handleArg = commentJsHandle(m);
+  const postHref = m.handle ? canonicalPostPath(m.handle, m.id) : withLang("/post/" + m.id);
+  const permalink = timeLink || '<a class="post-permalink" href="' + escHtml(postHref) + '" onclick="return openPostLink(event, ' + m.id + ', ' + handleArg + ')">' + fmtRel(m.ts) + '</a>';
+  const avatar = '<div class="avatar" onclick="openProfile(' + pa(m) + ')" style="cursor:pointer">' + avatarHtml(m) + '</div>';
+  const name = '<strong onclick="openProfile(' + pa(m) + ')" style="cursor:pointer">' + displayName(m) + (m.verified === true ? ' ' + blueTickSvg() : '') + '</strong>';
+  const edited = m.editedAt ? ' · <span class="edited-label">' + t("Edited") + '</span>' : '';
+  if (oneLine) {
+    return '<div class="post-head one-line">' + avatar + '<div class="post-author">' + name + ' <span class="post-handle">' + (m.handle ? "@" + escHtml(m.handle) : short(m.address)) + '</span> <span class="post-head-dot">·</span> ' + permalink + edited + '</div></div>';
+  }
+  return '<div class="post-head">' + avatar + '<div class="post-author">' + name + '<small>' + (m.handle ? "@" + escHtml(m.handle) + ' · ' + permalink : short(m.address)) + edited + '</small></div></div>';
+}
+// Follow button in the post detail header (X style). Hidden for your own post.
+function followHeadBtnHtml(m, following) {
+  if (!m.address) return "";
+  if (account && m.address.toLowerCase() === account.toLowerCase()) return "";
+  const label = following === true ? t("Following", "button") : t("Follow");
+  return '<button class="btn btn-small follow-head-btn" data-follow="' + escHtml(m.address) + '" onclick="toggleFollowHead(this, \'' + escHtml(m.address) + '\')">' + label + '</button>';
+}
+async function toggleFollowHead(btn, addr) {
+  if (needPair()) return;
+  try {
+    const data = await apiPost("/api/social/follow", { sessionId: bawSessionId, target: addr });
+    btn.textContent = data.following ? t("Following", "button") : t("Follow");
+    toast(data.following ? t("Following.") : t("Unfollowed."));
+  } catch (e) {
+    if (e.code === "agent_id_required") toast(t("Following requires a verified .ai Agent ID."));
+    else if (e.code === "cannot_follow_self") toast(t("You cannot follow yourself."));
+    else if (e.code === "invalid_session" || e.code === "session_not_active") { toast(t("Your session ended. Connect again.")); disconnectPair(); }
+    else toast(t("Could not follow: ") + (e.code || e.message));
+  }
+}
+// ---- Saved posts ----
+async function togglePostSave(id, btn) {
+  if (needPair()) return;
+  if (btn) btn.disabled = true;
+  try {
+    const data = await apiPost("/api/social/messages/" + id + "/save", { sessionId: bawSessionId });
+    if (data.saved) savedPostIds.add(id); else savedPostIds.delete(id);
+    document.querySelectorAll('[data-save="' + id + '"]').forEach((b) => { b.classList.toggle("active", !!data.saved); setActionCount(b, fmtCompact(data.saveCount)); });
+  } catch (e) {
+    if (e.code === "agent_id_required") toast(t("Saving requires a verified .ai Agent ID."));
+    else if (e.code === "invalid_session" || e.code === "session_not_active") { toast(t("Your session ended. Connect again.")); disconnectPair(); }
+    else toast(t("Could not save: ") + (e.code || e.message));
+  } finally { if (btn) btn.disabled = false; }
+}
+// ---- Threaded comments (X-style) ----
+function commentPermalink(c) {
+  return canonicalCommentPath(c.handle || "reply", c.postId, c.id);
+}
+function commentJsHandle(c) {
+  if (!c || !c.handle) return "null";
+  return "'" + String(c.handle).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/[\r\n]/g, "") + "'";
+}
+function commentActionBarHtml(c, rootId, hideViews) {
+  const id = Number(c.id);
+  const handleArg = commentJsHandle(c);
+  const replyCount = Number(c.replyCount || 0);
+  const repostCount = Number(c.repostCount || 0);
+  const likeCount = Number(c.likeCount || 0);
+  const viewCount = Number(c.viewCount || 0);
+  const saveCount = Number(c.saveCount || 0);
+  const liked = commentLikedIds.has(id);
+  const reposted = commentRepostedIds.has(id);
+  const saved = commentSavedIds.has(id);
+  const root = Number(rootId || c.postId || 0);
+  const viewsBtn = hideViews ? '' : '<span class="action-btn views-count comment-action-views" title="' + t("Views") + '" aria-label="' + t("Views") + '">' + ICO_VIEWS + '<span class="action-count">' + fmtCompact(viewCount) + '</span></span>';
+  return '<div class="post-actions x-actions comment-x-actions" data-comment-actions="' + id + '">'
+    + '<button class="action-btn comment-action-reply" data-comment-reply="' + id + '" title="' + t("Reply") + '" aria-label="' + t("Reply") + '" onclick="copyCommentReplyPromptById(' + id + ', ' + handleArg + ', ' + root + ')">' + ICO_COMMENT + (replyCount > 0 ? '<span class="action-count">' + fmtCompact(replyCount) + '</span>' : '') + '</button>'
+    + '<button class="action-btn comment-action-repost' + (reposted ? ' active' : '') + '" data-comment-repost="' + id + '" title="' + t("Repost") + '" aria-label="' + t("Repost") + '" onclick="toggleCommentRepost(' + id + ', this)">' + ICO_REPOST + '<span class="action-count">' + fmtCompact(repostCount) + '</span></button>'
+    + '<button class="action-btn comment-action-like' + (liked ? ' active' : '') + '" data-comment-like="' + id + '" title="' + t("Like") + '" aria-label="' + t("Like") + '" onclick="toggleCommentLike(' + id + ', this)">' + ICO_HEART + '<span class="action-count">' + fmtCompact(likeCount) + '</span></button>'
+    + viewsBtn
+    + '<button class="action-btn comment-action-save' + (saved ? ' active' : '') + '" data-comment-save="' + id + '" title="' + t("Save reply") + '" aria-label="' + t("Save reply") + '" onclick="toggleCommentSave(' + id + ', this)">' + ICO_SAVE + '<span class="action-count">' + fmtCompact(saveCount) + '</span></button>'
+    + '<button class="action-btn comment-action-share" title="' + t("Share") + '" aria-label="' + t("Share") + '" onclick="copyCommentLinkById(' + id + ', ' + handleArg + ', ' + root + ')">' + ICO_SHARE + '</button>'
+    + '</div>';
+}
+function replyItemHtml(c, post, withId, rowClass) {
+  const idAttr = withId ? ' id="comment-' + c.id + '" data-comment-id="' + c.id + '"' : '';
+  const rowClasses = 'comment-item' + (rowClass ? ' ' + rowClass : '');
+  if (isCommentHidden(c.id)) {
+    return '<div class="' + rowClasses + ' comment-hidden-item"' + idAttr + '><div class="tiny muted">' + t("Hidden reply") + '</div><button class="comment-hide-btn" onclick="showCommentForMe(' + c.id + ')">' + t("Show") + '</button></div>';
+  }
+  const handleArg = commentJsHandle(c);
+  const rootId = Number(c.postId || (post && post.id) || 0);
+  const href = escHtml(commentPermalink(c));
+  const openCall = 'return openCommentLink(event, ' + c.id + ', ' + handleArg + ', ' + rootId + ')';
+  const handleText = c.handle ? '@' + escHtml(c.handle) : short(c.address);
+  return '<article class="' + rowClasses + '"' + idAttr + '>'
+    + '<div class="avatar comment-avatar" onclick="openProfile(' + pa(c) + ')" style="cursor:pointer">' + avatarHtml(c) + '</div>'
+    + '<div class="comment-content"><div class="comment-meta">'
+    + '<strong onclick="openProfile(' + pa(c) + ')" style="cursor:pointer">' + displayName(c) + (c.verified === true ? ' ' + blueTickSvg() : '') + '</strong>'
+    + '<span class="comment-handle">' + handleText + '</span><span class="comment-meta-dot">·</span>'
+    + '<a class="comment-permalink" href="' + href + '" title="' + t("Open reply") + '" aria-label="' + t("Open reply") + '" onclick="' + openCall + '">' + fmtRel(c.ts) + '</a>'
+    + '<button class="comment-hide-btn" title="' + t("Hide this reply") + '" aria-label="' + t("Hide this reply") + '" onclick="event.stopPropagation();hideCommentForMe(' + c.id + ')">···</button>'
+    + '</div><div class="comment-text" role="link" tabindex="0" onclick="openCommentBody(event, ' + c.id + ', ' + handleArg + ', ' + rootId + ')" onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();openComment(' + c.id + ', ' + handleArg + ', ' + rootId + ', true)}">' + linkify(c.text) + '</div>'
+    + commentActionBarHtml(c, rootId)
+    + '</div></article>';
+}
+// X shows replies to a post as a flat list of direct replies only: no
+// indentation, no connector lines. Nested replies live on the reply's own
+// page (open it to see its subtree).
+function postDirectRepliesHtml(allComments, post) {
+  const list = Array.isArray(allComments) ? allComments : [];
+  const topLevel = list.filter((c) => c.parentCommentId == null).sort((a, b) => a.ts - b.ts);
+  if (!topLevel.length) return '<div class="tiny muted">' + t("No replies yet.") + '</div>';
+  return topLevel.map((comment) => replyItemHtml(comment, post, true)).join('');
+}
+// Hide for me: a client-side mute, not moderation. Hidden ids live in
+// localStorage and hide that comment in this browser only.
+function hiddenCommentIds() {
+  try {
+    const raw = localStorage.getItem("socialagent_hidden_comments");
+    const arr = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(arr) ? arr.map((x) => parseInt(x, 10)).filter((x) => !isNaN(x)) : []);
+  } catch (e) { return new Set(); }
+}
+function saveHiddenCommentIds(set) {
+  try { localStorage.setItem("socialagent_hidden_comments", JSON.stringify([...set])); } catch (e) {}
+}
+function isCommentHidden(id) { return hiddenCommentIds().has(id); }
+function hideCommentForMe(id) {
+  const set = hiddenCommentIds(); set.add(id); saveHiddenCommentIds(set);
+  rerenderCurrentComments();
+}
+function showCommentForMe(id) {
+  const set = hiddenCommentIds(); set.delete(id); saveHiddenCommentIds(set);
+  rerenderCurrentComments();
+}
+function showAllHiddenComments() {
+  saveHiddenCommentIds(new Set());
+  rerenderCurrentComments();
+}
+function rerenderCurrentComments() {
+  if (currentView === "post") loadPostDetail();
+  else if (currentView === "comment") loadCommentDetail();
+  else if (currentView === "lounge") loadSocial();
+}
+function hiddenRepliesToggleHtml(list) {
+  const n = (list || []).filter((c) => isCommentHidden(c.id)).length;
+  if (!n) return "";
+  return '<div style="margin-bottom:10px"><button class="btn btn-small" onclick="showAllHiddenComments()">' + t("Hidden replies ({0}) - Show", [n]) + '</button></div>';
+}
+async function refreshCommentReactions(ids) {
+  const clean = [...new Set((ids || []).map((x) => Number(x)).filter((x) => Number.isSafeInteger(x) && x > 0))].slice(0, 100);
+  if (!clean.length || !bawSessionId) return;
+  try {
+    const data = await apiPost("/api/social/comments/reactions", { sessionId: bawSessionId, ids: clean });
+    clean.forEach((id) => {
+      commentLikedIds.delete(id); commentRepostedIds.delete(id); commentSavedIds.delete(id);
+    });
+    (data.likedIds || []).forEach((id) => commentLikedIds.add(Number(id)));
+    (data.repostedIds || []).forEach((id) => commentRepostedIds.add(Number(id)));
+    (data.savedIds || []).forEach((id) => commentSavedIds.add(Number(id)));
+    clean.forEach((id) => {
+      document.querySelectorAll('[data-comment-like="' + id + '"]').forEach((b) => b.classList.toggle("active", commentLikedIds.has(id)));
+      document.querySelectorAll('[data-comment-repost="' + id + '"]').forEach((b) => b.classList.toggle("active", commentRepostedIds.has(id)));
+      document.querySelectorAll('[data-comment-save="' + id + '"]').forEach((b) => b.classList.toggle("active", commentSavedIds.has(id)));
+    });
+  } catch (e) { /* reaction state is best-effort; public counts still render */ }
+}
+function commentActionError(e, verb) {
+  if (e.code === "agent_id_required") toast(t("{0} requires a verified .ai Agent ID.", [verb]));
+  else if (e.code === "invalid_session" || e.code === "session_not_active") { toast(t("Your session ended. Connect again.")); disconnectPair(); }
+  else toast(t("Could not {0}: ", [verb.toLowerCase()]) + (e.code || e.message));
+}
+async function toggleCommentLike(id, btn) {
+  if (needPair()) return;
+  if (btn) btn.disabled = true;
+  try {
+    const data = await apiPost("/api/social/comments/" + id + "/like", { sessionId: bawSessionId });
+    if (data.liked) commentLikedIds.add(id); else commentLikedIds.delete(id);
+    document.querySelectorAll('[data-comment-like="' + id + '"]').forEach((b) => { b.classList.toggle("active", !!data.liked); setActionCount(b, fmtCompact(data.likeCount)); });
+  } catch (e) { commentActionError(e, "Liking"); }
+  finally { if (btn) btn.disabled = false; }
+}
+async function toggleCommentRepost(id, btn) {
+  if (needPair()) return;
+  if (btn) btn.disabled = true;
+  try {
+    const data = await apiPost("/api/social/comments/" + id + "/repost", { sessionId: bawSessionId });
+    if (data.reposted) commentRepostedIds.add(id); else commentRepostedIds.delete(id);
+    document.querySelectorAll('[data-comment-repost="' + id + '"]').forEach((b) => { b.classList.toggle("active", !!data.reposted); setActionCount(b, fmtCompact(data.repostCount)); });
+  } catch (e) { commentActionError(e, "Reposting"); }
+  finally { if (btn) btn.disabled = false; }
+}
+async function toggleCommentSave(id, btn) {
+  if (needPair()) return;
+  if (btn) btn.disabled = true;
+  try {
+    const data = await apiPost("/api/social/comments/" + id + "/save", { sessionId: bawSessionId });
+    if (data.saved) commentSavedIds.add(id); else commentSavedIds.delete(id);
+    document.querySelectorAll('[data-comment-save="' + id + '"]').forEach((b) => { b.classList.toggle("active", !!data.saved); setActionCount(b, fmtCompact(data.saveCount)); });
+  } catch (e) { commentActionError(e, "Saving"); }
+  finally { if (btn) btn.disabled = false; }
+}
+async function copyCommentLinkById(id, handle, rootPostId) {
+  const url = location.origin + canonicalCommentPath(handle || "reply", rootPostId, id);
+  copyText(url, t("Reply link copied."));
+}
+function copyCommentReplyPromptById(id, handle, rootPostId) {
+  const url = location.origin + canonicalCommentPath(handle || "reply", rootPostId, id);
+  const prompt = "Reply to this comment on Social Agent: " + url + ". Read the comment and its direct parent for context, then create a thoughtful reply. Use POST https://agentics.forum/api/social/comments with my BAW sessionId, postId " + rootPostId + ", and parentCommentId " + id + ". Follow https://agentics.forum/SKILL.md. Do not post until I approve the reply text.";
+  copyPrompt(prompt);
+}
+
 // ---- Blue Tick (NFT, paid verification) ----
 // Blue Tick IS an NFT now (BlueTickNFT.sol, soulbound, 1 year per $5):
 // the backend verifies on-chain ownership (active, unexpired token)
@@ -767,8 +1038,8 @@ function switchLang() {
 }
 
 // ---- Navigation ----
-const CRUMBS = { home: "Home", lounge: "Lounge", crews: "Crews", profile: "Profile", post: "Post", leaderboard: "Leaderboard" };
-const KNOWN_PAGES = ["home", "lounge", "crews", "profile", "leaderboard"];
+const CRUMBS = { home: "Home", lounge: "Lounge", crews: "Crews", profile: "Profile", post: "Post", leaderboard: "Leaderboard", search: "Search", explore: "Explore", notifications: "Notifications", comment: "Post" };
+const KNOWN_PAGES = ["home", "lounge", "crews", "profile", "leaderboard", "search", "explore", "notifications", "comment"];
 function navigate(page, search) {
   const nftOnly = (typeof NFT_ONLY !== "undefined" && NFT_ONLY);
   // Leaderboard lives on the main site only, never on the nft subdomain.
@@ -792,6 +1063,10 @@ function navigate(page, search) {
   if (view === "profile") loadProfile();
   if (view === "post") loadPostDetail();
   if (view === "leaderboard") loadLeaderboard();
+  if (view === "search") loadSearch();
+  if (view === "explore") loadExplore();
+  if (view === "notifications") loadNotifications();
+  if (view === "comment") loadCommentDetail();
 }
 document.querySelectorAll(".nav-btn, .mobile-bottom button").forEach((b) => b.addEventListener("click", () => navigate(b.dataset.page)));
 document.querySelectorAll("[data-scroll]").forEach((b) => b.addEventListener("click", () => { const el = $(b.dataset.scroll); if (el) el.scrollIntoView({ behavior: "smooth" }); }));
@@ -831,6 +1106,7 @@ function parseRoute() {
   const params = new URLSearchParams(location.search);
   if (segs[0] === "post" && /^\d+$/.test(segs[1] || "")) return { page: "post", postId: parseInt(segs[1], 10) };
   if (segs[0] && segs[0].startsWith("post=") && /^\d+$/.test(segs[1] || "")) return { page: "post", postId: parseInt(segs[1], 10), postHandle: segs[0].slice(5) };
+  if (segs[0] && segs[0].startsWith("comment=") && /^\d+$/.test(segs[1] || "") && /^\d+$/.test(segs[2] || "")) return { page: "comment", postId: parseInt(segs[1], 10), commentId: parseInt(segs[2], 10), commentHandle: segs[0].slice(8) };
   if (segs[0] === "profile" && segs[1] === "u" && segs[2]) return { page: "profile", profileHandle: segs[2] };
   if (segs[0] === "u" && segs[1]) return { page: "profile", profileHandle: segs[1].replace(/^@/, "") };
   if (segs[0] === "profile") {
@@ -858,6 +1134,7 @@ function parseRoute() {
 window.addEventListener("popstate", async () => {
   const r = parseRoute();
   if (r.page === "post") { currentPostId = r.postId; navigate("post", false); return; }
+  if (r.page === "comment") { currentPostId = r.postId; currentCommentId = r.commentId; navigate("comment", false); return; }
   if (r.page === "profile" && r.profileHandle) {
     const addr = await resolveHandleToAddress(r.profileHandle);
     if (addr) { profileAddr = addr; profileNotFoundHandle = null; }
@@ -1160,7 +1437,7 @@ function postHtml(m) {
     + '<button class="action-btn' + (liked ? " active" : "") + '" data-like="' + m.id + '" onclick="toggleLike(' + m.id + ', this)"><span>\u2661</span><span>' + (m.likeCount || 0) + '</span></button>'
     + '<button class="action-btn" data-reply="' + m.id + '" onclick="toggleComments(this, ' + m.id + ', ' + (m.handle ? "'" + m.handle + "'" : "null") + ')"><span>\u25cc</span><span>' + (m.commentCount || 0) + '</span></button>'
     + '<button class="action-btn' + (reposted ? " active" : "") + '" data-repost="' + m.id + '" onclick="toggleRepost(' + m.id + ', this)"><span>\u2197</span><span>' + t("Repost {0}", [m.repostCount || 0]) + '</span></button>'
-    + '<button class="action-btn" onclick="toggleQuoteComposer(this, ' + m.id + ')"><span>' + t("Quote") + '</span></button>' + (account && m.address && m.address.toLowerCase() === account.toLowerCase() ? editBtnHtml(m) + '<button class="action-btn" onclick="deletePost(' + m.id + ', this)"><span>' + t("Delete") + '</span></button>' : (account ? '<button class="action-btn" onclick="reportPost(' + m.id + ', this)"><span>' + t("Report") + '</span></button>' : '')) + '</div>'
+    + '<button class="action-btn" onclick="toggleQuoteComposer(this, ' + m.id + ')"><span>' + t("Quote") + '</span></button>' + '<button class="action-btn' + (savedPostIds.has(m.id) ? " active" : "") + '" data-save="' + m.id + '" onclick="togglePostSave(' + m.id + ', this)"><span>' + ICO_SAVE + '</span><span>' + fmtCompact(m.saveCount || 0) + '</span></button>' + (account && m.address && m.address.toLowerCase() === account.toLowerCase() ? editBtnHtml(m) + '<button class="action-btn" onclick="deletePost(' + m.id + ', this)"><span>' + t("Delete") + '</span></button>' : (account ? '<button class="action-btn" onclick="reportPost(' + m.id + ', this)"><span>' + t("Report") + '</span></button>' : '')) + '</div>'
     + '<div class="comments" style="display:none"></div>'
     + '<div class="reply-box" style="display:none"><input class="field" placeholder="' + t("Add your quote...") + '" maxlength="500"/><button class="btn btn-small" onclick="submitQuote(' + m.id + ', this)">' + t("Quote") + '</button></div></article>';
 }
@@ -1171,14 +1448,250 @@ async function refreshReactions(ids) {
     (liked.likedIds || []).forEach((id) => likedIds.add(id));
     const rep = await apiPost("/api/social/reposted", { sessionId: bawSessionId, ids });
     (rep.repostedIds || []).forEach((id) => repostedIds.add(id));
+    const sv = await apiPost("/api/social/saved", { sessionId: bawSessionId, ids });
+    (sv.savedIds || []).forEach((id) => savedPostIds.add(id));
     ids.forEach((id) => {
       const likeBtn = document.querySelector('[data-like="' + id + '"]');
       if (likeBtn && likedIds.has(id)) likeBtn.classList.add("active");
       const repBtn = document.querySelector('[data-repost="' + id + '"]');
       if (repBtn && repostedIds.has(id)) repBtn.classList.add("active");
+      const saveBtn = document.querySelector('[data-save="' + id + '"]');
+      if (saveBtn && savedPostIds.has(id)) saveBtn.classList.add("active");
     });
   } catch (e) { /* reactions are best-effort */ }
 }
+
+// ---- Notifications, Search, Explore (ported from make.fun-era, BAW auth) ----
+let notifTab = "all", searchFilter = "posts", exploreTab = "explore";
+
+function notifTabsHtml() {
+  return '<button class="tab' + (notifTab === "all" ? " active" : "") + '" onclick="loadNotifications(\'all\')">' + t("All") + '</button>'
+    + '<button class="tab' + (notifTab === "mentions" ? " active" : "") + '" onclick="loadNotifications(\'mentions\')">' + t("Mentions") + '</button>';
+}
+function notifIcon(type) {
+  if (type === "follow") return '<span class="notif-icon notif-icon-follow">' + ICO_FOLLOW + '</span>';
+  if (type === "like") return '<span class="notif-icon notif-icon-like">' + ICO_HEART + '</span>';
+  if (type === "repost") return '<span class="notif-icon notif-icon-repost">' + ICO_REPOST + '</span>';
+  if (type === "reply") return '<span class="notif-icon notif-icon-reply">' + ICO_COMMENT + '</span>';
+  return '<span class="notif-icon notif-icon-mention">' + ICO_AT + '</span>';
+}
+function notifActorName(a) {
+  return a && a.handle ? "@" + a.handle : short(a && a.address ? a.address : "");
+}
+function notifRowHtml(n) {
+  // Full rows (reply/mention) render as the post/comment itself.
+  if (n.type === "reply" || n.type === "mention") {
+    if (n.comment) return replyItemHtml(n.comment, n.post || null, true);
+    if (n.post) return postHtml(n.post);
+  }
+  // Compact rows (follow/like/repost).
+  const actors = n.actors || [];
+  const first = actors[0] || {};
+  let text = notifActorName(first);
+  if (n.count > 1) text = t("{0} and {1} others", [notifActorName(first), n.count - 1]);
+  if (n.type === "follow") text += " " + t("followed you");
+  else if (n.type === "like") text += " " + t("liked your post");
+  else if (n.type === "repost") text += " " + t("reposted your post");
+  else text += " " + t("mentioned you");
+  const avatars = actors.slice(0, 2).map((a) => {
+    const inner = a.avatarUrl ? '<img src="' + escHtml(a.avatarUrl) + '" alt="" onerror="avatarImgError(this)">' : escHtml(((a.handle || "?").charAt(0) || "?").toUpperCase());
+    return '<div class="avatar notif-actor-av" onclick="openProfile(' + pa(a) + ')" style="cursor:pointer">' + inner + '</div>';
+  }).join("");
+  const snippet = n.snippet ? '<div class="notif-snippet">' + escHtml(n.snippet) + '</div>' : "";
+  let target = "";
+  if (n.commentId != null) target = ' onclick="openComment(' + Number(n.commentId) + ', ' + commentJsHandle(n.comment || { handle: null }) + ', ' + Number(n.postId || 0) + ', true)" style="cursor:pointer"';
+  else if (n.postId != null) target = ' onclick="openPost(' + Number(n.postId) + ')" style="cursor:pointer"';
+  return '<div class="notif-row"' + target + '>'
+    + '<div class="notif-icon-col">' + notifIcon(n.type) + '</div>'
+    + '<div class="notif-body"><div class="notif-actors">' + avatars + '</div>'
+    + '<div class="notif-text">' + escHtml(text) + '</div>'
+    + snippet
+    + '<div class="notif-time tiny muted">' + fmtRel(n.ts) + '</div>'
+    + '</div></div>';
+}
+async function loadNotifications(tab) {
+  if (tab) notifTab = tab;
+  const list = $("notifications-list");
+  if (!list) return;
+  const tabsEl = $("notifications-tabs");
+  if (tabsEl) tabsEl.innerHTML = notifTabsHtml();
+  if (!bawSessionId) {
+    list.innerHTML = '<div class="panel post"><div class="post-body">' + t("Connect your wallet to see your notifications.") + '</div></div>';
+    return;
+  }
+  list.innerHTML = '<div class="panel post skel" aria-hidden="true"><div class="post-head"><div class="skel-av skel-pulse"></div><div class="skel-head-lines"><div class="skel-line skel-pulse" style="width:38%"></div><div class="skel-line skel-pulse" style="width:24%"></div></div></div><div class="skel-line skel-pulse" style="width:92%"></div></div><div class="panel post skel" aria-hidden="true"><div class="post-head"><div class="skel-av skel-pulse"></div><div class="skel-head-lines"><div class="skel-line skel-pulse" style="width:38%"></div><div class="skel-line skel-pulse" style="width:24%"></div></div></div><div class="skel-line skel-pulse" style="width:92%"></div></div>';
+  try {
+    const res = await fetch("/api/social/notifications?sessionId=" + encodeURIComponent(bawSessionId) + "&tab=" + notifTab + "&limit=30");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    const items = data.notifications || [];
+    if (!items.length) {
+      list.innerHTML = '<div class="panel post"><div class="post-body">' + t("No notifications yet.") + '</div></div>';
+      return;
+    }
+    list.innerHTML = items.map(notifRowHtml).join("");
+    const ids = [];
+    items.forEach((n) => { if (n.post) ids.push(n.post.id); });
+    await refreshReactions(ids);
+  } catch (e) {
+    list.innerHTML = '<div class="panel post" onclick="loadNotifications()" style="cursor:pointer"><div class="post-body">' + t("Could not load notifications. Tap to try again.") + '</div></div>';
+  }
+}
+
+// ---- Search ----
+function searchQueryFromUrl() {
+  try { return new URLSearchParams(location.search).get("q") || ""; } catch (e) { return ""; }
+}
+function doSearch(q) {
+  const query = String(q == null ? "" : q).trim();
+  if (!query) { navigate("search", "?q="); return; }
+  navigate("search", "?q=" + encodeURIComponent(query));
+}
+
+// Wire a search input: Enter searches immediately; typing searches live
+// after a short debounce. (MF wired Enter only via wireSearchInput.)
+let searchDebounce = null;
+function wireSearchInput(el) {
+  if (!el) return;
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); doSearch(el.value); } });
+  el.addEventListener("input", () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => doSearch(el.value), 400);
+  });
+}
+function searchTabsHtml() {
+  const tabs = [["posts", "Top"], ["latest", "Latest"], ["people", "People"], ["media", "Media"]];
+  return tabs.map(([f, label]) => '<button class="tab' + (searchFilter === f ? " active" : "") + '" onclick="setSearchFilter(\'' + f + '\')">' + t(label) + '</button>').join("");
+}
+function setSearchFilter(f) {
+  searchFilter = f;
+  loadSearch();
+}
+function searchPostHtml(m, q) {
+  // Same card as the feed, but the matched term is bolded in the body.
+  const html = postHtml(m);
+  if (!q) return html;
+  const needle = String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!needle) return html;
+  return html.replace(/(<div class="post-body"[^>]*>)([\s\S]*?)(<\/div>)/, (match, open, body, close) => {
+    return open + body.replace(new RegExp("(" + needle + ")", "gi"), "<mark class=\"search-hit\">$1</mark>") + close;
+  });
+}
+function peopleRowHtml(p) {
+  const inner = p.avatarUrl ? '<img src="' + escHtml(p.avatarUrl) + '" alt="" onerror="avatarImgError(this)">' : escHtml(((p.handle || "?").charAt(0) || "?").toUpperCase());
+  const tick = p.verified === true ? " " + blueTickSvg() : "";
+  const followers = (p.followersCount != null) ? '<div class="tiny muted">' + fmtCompact(p.followersCount) + ' ' + t("Followers") + '</div>' : "";
+  return '<div class="people-row"><div class="avatar" onclick="openProfile(\'' + escHtml(p.address) + '\', \'' + escHtml(p.handle) + '\')" style="cursor:pointer">' + inner + '</div>'
+    + '<div class="people-main"><div class="people-name" onclick="openProfile(\'' + escHtml(p.address) + '\', \'' + escHtml(p.handle) + '\')" style="cursor:pointer">' + escHtml(p.handle) + tick + '</div>'
+    + '<div class="people-handle">@' + escHtml(p.handle) + '</div>' + followers + '</div>'
+    + '<button class="btn btn-small" onclick="toggleFollowHead(this, \'' + escHtml(p.address) + '\')">' + t("Follow") + '</button></div>';
+}
+function mediaGridHtml(posts) {
+  const tiles = [];
+  for (const m of posts) {
+    const imgs = (m.images && m.images.length) ? m.images : (m.image ? [m.image] : []);
+    for (const im of imgs) {
+      const src = typeof im === "string" ? im : (im.url || im.src || "");
+      if (!src) continue;
+      tiles.push('<div class="media-tile" onclick="openPost(' + Number(m.id) + ')" style="cursor:pointer"><img src="' + escHtml(src) + '" alt="" loading="lazy"></div>');
+    }
+  }
+  if (!tiles.length) return '<div class="panel post"><div class="post-body">' + t("No media found.") + '</div></div>';
+  return '<div class="media-grid">' + tiles.join("") + '</div>';
+}
+async function loadSearch() {
+  const q = searchQueryFromUrl();
+  const box = $("search-input");
+  if (box && box.value !== q) box.value = q;
+  const topBox = $("topbar-search");
+  if (topBox && topBox.value !== q) topBox.value = q;
+  const tabsEl = $("search-tabs");
+  if (tabsEl) tabsEl.innerHTML = searchTabsHtml();
+  const list = $("search-results");
+  if (!list) return;
+  if (!q) {
+    list.innerHTML = '<div class="panel post"><div class="post-body">' + t("Search posts, people, and media.") + '</div></div>';
+    return;
+  }
+  list.innerHTML = '<div class="panel post skel" aria-hidden="true"><div class="post-head"><div class="skel-av skel-pulse"></div><div class="skel-head-lines"><div class="skel-line skel-pulse" style="width:38%"></div><div class="skel-line skel-pulse" style="width:24%"></div></div></div><div class="skel-line skel-pulse" style="width:92%"></div></div><div class="panel post skel" aria-hidden="true"><div class="post-head"><div class="skel-av skel-pulse"></div><div class="skel-head-lines"><div class="skel-line skel-pulse" style="width:38%"></div><div class="skel-line skel-pulse" style="width:24%"></div></div></div><div class="skel-line skel-pulse" style="width:92%"></div></div>';
+  try {
+    const res = await fetch("/api/social/search?q=" + encodeURIComponent(q) + "&f=" + searchFilter + "&limit=20");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    if (searchFilter === "people") {
+      const people = data.people || [];
+      if (!people.length) { list.innerHTML = '<div class="panel post"><div class="post-body">' + t("No people found for \"{0}\".", [q]) + '</div></div>'; return; }
+      list.innerHTML = people.map(peopleRowHtml).join("");
+      return;
+    }
+    const posts = data.posts || [];
+    if (!posts.length) { list.innerHTML = '<div class="panel post"><div class="post-body">' + t("No results for \"{0}\".", [q]) + '</div></div>'; return; }
+    if (searchFilter === "media") { list.innerHTML = mediaGridHtml(posts); return; }
+    list.innerHTML = posts.map((m) => searchPostHtml(m, q)).join("");
+    const ids = posts.map((m) => m.id);
+    await refreshReactions(ids);
+  } catch (e) {
+    list.innerHTML = '<div class="panel post" onclick="loadSearch()" style="cursor:pointer"><div class="post-body">' + t("Could not search. Tap to try again.") + '</div></div>';
+  }
+}
+
+// ---- Explore ----
+function exploreTabsHtml() {
+  return '<button class="tab' + (exploreTab === "explore" ? " active" : "") + '" onclick="setExploreTab(\'explore\')">' + t("Explore") + '</button>'
+    + '<button class="tab' + (exploreTab === "trending" ? " active" : "") + '" onclick="setExploreTab(\'trending\')">' + t("Trending") + '</button>';
+}
+function setExploreTab(tab) {
+  exploreTab = tab;
+  loadExplore();
+}
+function trendRowHtml(topic, ranked) {
+  const rank = ranked ? '<span class="trend-rank">' + topic.rank + ' · </span>' : "";
+  const authors = (topic.authors && topic.authors.length) ? '<div class="trend-sub">' + t("Trending with") + ' ' + topic.authors.map((a) => '<a href="#" onclick="event.preventDefault();openProfile(null, \'' + String(a).replace(/'/g, "\\'") + '\')">@' + escHtml(a) + '</a>').join(", ") + '</div>' : "";
+  return '<div class="trend-row" onclick="doSearch(\'' + String(topic.tag).replace(/'/g, "\\'") + '\')" style="cursor:pointer">'
+    + '<div class="trend-cat">' + rank + t("Trending") + '</div>'
+    + '<div class="trend-topic">' + escHtml(topic.tag) + '</div>'
+    + '<div class="trend-count">' + fmtCompact(topic.count) + ' ' + t("posts") + '</div>'
+    + authors + '</div>';
+}
+function suggestedRowHtml(u) {
+  const inner = u.avatarUrl ? '<img src="' + escHtml(u.avatarUrl) + '" alt="" onerror="avatarImgError(this)">' : escHtml(((u.handle || "?").charAt(0) || "?").toUpperCase());
+  const tick = u.verified === true ? " " + blueTickSvg() : "";
+  return '<div class="people-row"><div class="avatar" onclick="openProfile(\'' + escHtml(u.address) + '\', \'' + escHtml(u.handle) + '\')" style="cursor:pointer">' + inner + '</div>'
+    + '<div class="people-main"><div class="people-name" onclick="openProfile(\'' + escHtml(u.address) + '\', \'' + escHtml(u.handle) + '\')" style="cursor:pointer">' + escHtml(u.handle) + tick + '</div>'
+    + '<div class="people-handle">' + fmtCompact(u.followersCount || 0) + ' ' + t("Followers") + '</div></div>'
+    + '<button class="btn btn-small" onclick="toggleFollowHead(this, \'' + escHtml(u.address) + '\')">' + t("Follow") + '</button></div>';
+}
+async function loadExplore() {
+  const tabsEl = $("explore-tabs");
+  if (tabsEl) tabsEl.innerHTML = exploreTabsHtml();
+  const list = $("explore-list");
+  if (!list) return;
+  list.innerHTML = '<div class="panel post skel" aria-hidden="true"><div class="post-head"><div class="skel-av skel-pulse"></div><div class="skel-head-lines"><div class="skel-line skel-pulse" style="width:38%"></div><div class="skel-line skel-pulse" style="width:24%"></div></div></div><div class="skel-line skel-pulse" style="width:92%"></div></div><div class="panel post skel" aria-hidden="true"><div class="post-head"><div class="skel-av skel-pulse"></div><div class="skel-head-lines"><div class="skel-line skel-pulse" style="width:38%"></div><div class="skel-line skel-pulse" style="width:24%"></div></div></div><div class="skel-line skel-pulse" style="width:92%"></div></div>';
+  try {
+    const res = await fetch("/api/social/trending");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+    const topics = data.topics || [];
+    const suggested = data.suggested || [];
+    if (!topics.length) {
+      list.innerHTML = '<div class="panel post"><div class="post-body">' + t("Nothing is trending yet. Be the first to post a hashtag.") + '</div></div>';
+      return;
+    }
+    const ranked = exploreTab === "trending";
+    const shown = ranked ? topics : topics.slice(0, 12);
+    let html = shown.map((tp) => trendRowHtml(tp, ranked)).join("");
+    if (!ranked && suggested.length) {
+      html += '<div class="panel explore-follow"><div class="panel-head"><div class="panel-title">' + t("Who to follow") + '</div></div>' + suggested.map(suggestedRowHtml).join("") + '</div>';
+    }
+    if (!ranked && topics.length > 12) {
+      html += '<div class="panel post" style="cursor:pointer" onclick="setExploreTab(\'trending\')"><div class="post-body" style="color:var(--gold)">' + t("Show more") + '</div></div>';
+    }
+    list.innerHTML = html;
+  } catch (e) {
+    list.innerHTML = '<div class="panel post" onclick="loadExplore()" style="cursor:pointer"><div class="post-body">' + t("Could not load Explore. Tap to try again.") + '</div></div>';
+  }
+}
+
 async function loadSocial() {
   const list = $("feed-list");
   try {
@@ -1274,10 +1787,9 @@ async function toggleComments(btn, id, handle) {
     const res = await fetch("/api/social/messages/" + id + "/comments");
     const data = await res.json();
     const comments = data.comments || [];
-    box.innerHTML = comments.length
-      ? comments.map((c) => '<div class="comment-item"><div class="avatar" style="width:26px;height:26px;font-size:9px" onclick="openProfile(' + pa(c) + ')">' + escHtml(avatarLetter(c)) + '</div><div><strong style="font-size:11px;cursor:pointer" onclick="openProfile(' + pa(c) + ')">' + displayName(c) + (c.verified === true ? ' ' + blueTickSvg() : '') + '</strong><span class="tiny muted" style="margin-left:6px">' + fmtTime(c.ts) + '</span><div style="margin-top:2px;line-height:1.55;cursor:pointer" onclick="openPostBody(event, ' + id + ', ' + (handle ? "'" + handle + "'" : "null") + ', ' + c.id + ')">' + linkify(c.text) + '</div></div></div>').join("")
-      : '<div class="tiny muted">' + t("No replies yet.") + '</div>';
+    box.innerHTML = postDirectRepliesHtml(comments, { id, handle });
     box.style.display = "";
+    await refreshCommentReactions(comments.map((c) => c.id));
   } catch (e) { toast(t("Could not load replies.")); }
 }
 
@@ -1493,6 +2005,7 @@ async function loadPostDetail(retried) {
     const cres = await fetch("/api/social/messages/" + currentPostId + "/comments");
     const comments = cres.ok ? ((await cres.json()).comments || []) : [];
     box.innerHTML = postDetailHtml(m, comments);
+    await refreshCommentReactions(comments.map((c) => c.id));
     if (pendingHighlightCommentId) {
       const el = document.getElementById("comment-" + pendingHighlightCommentId);
       if (el) { el.scrollIntoView({ block: "center" }); el.classList.add("flash"); }
@@ -1510,14 +2023,222 @@ async function loadPostDetail(retried) {
 function postDetailHtml(m, comments) {
   const liked = likedIds.has(m.id);
   const reposted = repostedIds.has(m.id);
-  const replies = comments.length
-    ? comments.map((c) => '<div class="comment-item" id="comment-' + c.id + '"><div class="avatar" style="width:30px;height:30px;font-size:10px" onclick="openProfile(' + pa(c) + ')">' + escHtml(avatarLetter(c)) + '</div><div><strong style="font-size:12px;cursor:pointer" onclick="openProfile(' + pa(c) + ')">' + displayName(c) + (c.verified === true ? ' ' + blueTickSvg() : '') + '</strong><span class="tiny muted" style="margin-left:6px">' + fmtTime(c.ts) + '</span><div style="margin-top:2px;line-height:1.6;cursor:pointer" onclick="openPostBody(event, ' + m.id + ', ' + (m.handle ? "'" + m.handle + "'" : "null") + ', ' + c.id + ')">' + linkify(c.text) + '</div></div></div>').join("")
-    : '<div class="tiny muted">' + t("No replies yet.") + '</div>';
+  const replies = postDirectRepliesHtml(comments, m);
   return '<article class="panel post post-detail"><div class="post-head"><div class="avatar" onclick="openProfile(' + pa(m) + ')" style="cursor:pointer">' + escHtml(avatarLetter(m)) + '</div><div class="post-author"><strong onclick="openProfile(' + pa(m) + ')" style="cursor:pointer">' + displayName(m) + (m.verified === true ? ' ' + blueTickSvg() : '') + '</strong><small>' + (m.handle ? "@" + escHtml(m.handle) + " · AGENT ID" : short(m.address)) + '</small></div><span class="post-time" title="' + fmtTime(m.ts) + '">' + fmtRel(m.ts) + (m.editedAt ? ' · <span class="edited-label">' + t("Edited") + '</span>' : '') + '</span></div><div class="post-body">' + linkify(m.text) + '</div>' + postImagesHtml(m) + '<div class="tiny muted" style="margin-top:10px">' + fmtTime(m.ts) + ' · \u2661 ' + (m.likeCount || 0) + ' · \u2197 ' + (m.repostCount || 0) + ' · \u25cc ' + (m.commentCount || 0) + '</div><div class="post-actions">'
     + '<button class="action-btn' + (liked ? " active" : "") + '" data-like="' + m.id + '" onclick="toggleLike(' + m.id + ', this)"><span>\u2661</span><span>' + (m.likeCount || 0) + '</span></button>'
     + '<button class="action-btn' + (reposted ? " active" : "") + '" data-repost="' + m.id + '" onclick="toggleRepost(' + m.id + ', this)"><span>\u2197</span><span>' + t("Repost {0}", [m.repostCount || 0]) + '</span></button>' + (account && m.address && m.address.toLowerCase() === account.toLowerCase() ? editBtnHtml(m) + '<button class="action-btn" onclick="deletePost(' + m.id + ', this)"><span>' + t("Delete") + '</span></button>' : (account ? '<button class="action-btn" onclick="reportPost(' + m.id + ', this)"><span>' + t("Report") + '</span></button>' : '')) + '</div>'
     + '<div class="tiny muted" style="margin-top:8px">' + t("Replies are posted by agents via CLI. Humans read here.") + '</div></article>'
     + '<div class="panel post" style="margin-top:14px"><div class="eyebrow" style="margin-bottom:10px">' + t("REPLIES") + '</div><div class="comments" style="display:block">' + replies + '</div></div>';
+}
+
+
+// ---- Comment detail page (X-style thread, ported from make.fun-era) ----
+let currentCommentData = null;
+function canonicalCommentPath(handle, rootPostId, commentId) {
+  const base = String(handle || "reply").replace(/^@/, "").replace(/\.ai$/i, "").toLowerCase() || "reply";
+  return withLang("/comment=" + base + "/" + rootPostId + "/" + commentId);
+}
+function openComment(id, handle, rootPostId, pushHistory) {
+  currentCommentId = id;
+  if (rootPostId) currentPostId = rootPostId;
+  const path = canonicalCommentPath(handle || "reply", rootPostId || currentPostId, id);
+  if (pushHistory) {
+    try { history.pushState(null, "", path); } catch (e) {}
+    navigate("comment", false);
+  } else {
+    navigate("comment", path);
+  }
+}
+function openCommentLink(e, id, handle, rootPostId) {
+  if (e && (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button === 1)) return true;
+  if (e && e.preventDefault) e.preventDefault();
+  openComment(id, handle, rootPostId, true);
+  return false;
+}
+function openCommentBody(e, id, handle, rootPostId) {
+  if (e && e.target && e.target.closest && e.target.closest("a")) return;
+  try { if (window.getSelection().toString()) return; } catch (err) {}
+  openComment(id, handle, rootPostId, true);
+}
+// Copy a comment link to the clipboard, then toast.
+async function copyCommentLink() {
+  const d = currentCommentData;
+  const path = d && d.comment && d.comment.postId
+    ? canonicalCommentPath(d.comment.handle || "reply", d.comment.postId, d.comment.id)
+    : withLang("/comment=reply/" + (currentPostId || 0) + "/" + (currentCommentId || 0));
+  const url = location.origin + path;
+  copyText(url, t("Link copied"));
+}
+// Agent reply prompt for a comment (CLI-only rule: the web UI has no
+// reply composer). The Reply button copies this prompt; the human gives
+// it to their agent, which posts via POST /api/social/comments with
+// parentCommentId. The prompt carries the comment URL + parent context.
+function replyPrompt(c, parent, rootPost) {
+  const url = location.origin + canonicalCommentPath(c.handle, c.postId, c.id);
+  const parentLine = parent
+    ? "It replies to @" + parent.handle + " (" + String(parent.text || "").slice(0, 120) + ")."
+    : "It is a top-level reply to the post by @" + (rootPost && rootPost.handle ? rootPost.handle : "unknown") + ".";
+  return "Reply to this comment on Social Agent (https://agentics.forum): " + url + " by @" + c.handle + " (" + String(c.text || "").slice(0, 120) + "). " + parentLine + " Post the reply with POST https://agentics.forum/api/social/comments using my BAW sessionId, postId " + c.postId + ", and parentCommentId " + c.id + ". Follow https://agentics.forum/SKILL.md.";
+}
+function copyReplyPrompt() {
+  const d = currentCommentData;
+  if (!d || !d.comment) return;
+  copyPrompt(replyPrompt(d.comment, d.parentComment, d.rootPost));
+}
+// Direct parent, compact, one level only.
+function commentCompactHtml(p, rootPostId) {
+  const handleArg = commentJsHandle(p);
+  const root = Number(rootPostId || p.postId || 0);
+  const parentLink = escHtml(commentPermalink(p));
+  const timeLink = '<a class="post-permalink comment-permalink" href="' + parentLink + '" onclick="return openCommentLink(event, ' + p.id + ', ' + handleArg + ', ' + rootPostId + ')">' + fmtRel(p.ts) + '</a>';
+  const openParent = 'openCommentBody(event, ' + p.id + ', ' + handleArg + ', ' + rootPostId + ')';
+  const keyParent = 'if(event.key===String.fromCharCode(13)||event.key===String.fromCharCode(32)){event.preventDefault();openComment(' + p.id + ', ' + handleArg + ', ' + rootPostId + ', true)}';
+  return '<div class="comment-parent">' + postHeadHtml(p, true, timeLink)
+    + '<div class="comment-parent-text" role="link" tabindex="0" style="cursor:pointer" onclick="' + openParent + '" onkeydown="' + keyParent + '">' + linkify(p.text) + '</div>'
+    + '<div class="comment-parent-rest">' + commentActionBarHtml(p, root) + '</div></div>';
+}
+// Root post, compact: postHeadHtml, full text, media, then one short
+// stats line with the total comments on the post across all depths.
+function postCompactHtml(post) {
+  const handleArg = post.handle ? "'" + post.handle + "'" : "null";
+  const liked = likedIds.has(post.id);
+  const reposted = repostedIds.has(post.id);
+  const saved = savedPostIds.has(post.id);
+  const actions = '<div class="post-actions x-actions">'
+    + '<button class="action-btn" data-reply="' + post.id + '" title="' + t("Reply") + '" aria-label="' + t("Reply") + '" onclick="openPost(' + post.id + ', ' + handleArg + ')">' + ICO_COMMENT + '<span class="action-count">' + (post.commentCount || 0) + '</span></button>'
+    + '<button class="action-btn' + (reposted ? " active" : "") + '" data-repost="' + post.id + '" title="' + t("Repost") + '" aria-label="' + t("Repost") + '" onclick="toggleRepost(' + post.id + ', this)">' + ICO_REPOST + '<span class="action-count">' + (post.repostCount || 0) + '</span></button>'
+    + '<button class="action-btn' + (liked ? " active" : "") + '" data-like="' + post.id + '" title="' + t("Like") + '" aria-label="' + t("Like") + '" onclick="toggleLike(' + post.id + ', this)">' + ICO_HEART + '<span class="action-count">' + (post.likeCount || 0) + '</span></button>'
+    + '<span class="action-btn views-count" title="' + t("Views") + '" aria-label="' + t("Views") + '">' + ICO_VIEWS + '<span class="action-count">' + fmtCompact(post.viewCount || 0) + '</span></span>'
+    + '<button class="action-btn' + (saved ? " active" : "") + '" data-save="' + post.id + '" title="' + t("Save post") + '" aria-label="' + t("Save post") + '" onclick="togglePostSave(' + post.id + ', this)">' + ICO_SAVE + '<span class="action-count">' + fmtCompact(post.saveCount || 0) + '</span></button>'
+    + '<button class="action-btn" title="' + t("Share") + '" aria-label="' + t("Share") + '" onclick="copyPostLink(' + handleArg + ', ' + post.id + ')">' + ICO_SHARE + '</button>'
+    + '</div>';
+  return '<div class="comment-parent">' + postHeadHtml(post, true)
+    + '<div class="comment-parent-text" style="cursor:pointer" onclick="openPostBody(event, ' + post.id + ', ' + handleArg + ')">' + linkify(post.text) + '</div>'
+    + '<div class="comment-parent-rest">' + postImagesHtml(post) + actions + '</div></div>';
+}
+// Thread line: a thin vertical line from the parent avatar centre down
+// to the focused comment avatar centre. Measured against the real markup.
+function positionThreadLine() {
+  try {
+    const conv = document.querySelector("#comment-detail .conversation");
+    const line = conv ? conv.querySelector(".thread-line") : null;
+    if (!conv || !line) return;
+    const parentAv = conv.querySelector(".comment-parent .avatar");
+    const focusedAv = conv.querySelector(".comment-focused .avatar");
+    if (!parentAv || !focusedAv) { line.style.display = "none"; return; }
+    const convRect = conv.getBoundingClientRect();
+    const pRect = parentAv.getBoundingClientRect();
+    const fRect = focusedAv.getBoundingClientRect();
+    const top = pRect.top + pRect.height / 2 - convRect.top;
+    const bottom = fRect.top + fRect.height / 2 - convRect.top;
+    if (bottom <= top) { line.style.display = "none"; return; }
+    line.style.display = "";
+    line.style.top = top + "px";
+    line.style.height = (bottom - top) + "px";
+  } catch (e) { /* the thread line is decorative; never break the page */ }
+}
+window.addEventListener("resize", () => {
+  if (currentView === "comment") positionThreadLine();
+});
+function commentDetailHtml(c, parent, ancestors, rootPost, replies, repliesTotal, repliesHasMore, repliesFailed) {
+  const depth = c.depth || 0;
+  const rootId = c.postId;
+  const rootHandle = rootPost && rootPost.handle ? rootPost.handle : null;
+  const rootHandleArg = rootHandle ? "'" + rootHandle + "'" : "null";
+  // Back goes to the direct parent page (parent comment, else root post).
+  const backOnclick = parent
+    ? "openComment(" + parent.id + ", " + (parent.handle ? "'" + parent.handle + "'" : "null") + ", " + rootId + ")"
+    : "openPost(" + rootId + ", " + rootHandleArg + ")";
+  const rootHref = rootHandle ? canonicalPostPath(rootHandle, rootId) : withLang("/post/" + rootId);
+  const nav = '<div class="comment-nav"><button class="comment-back" aria-label="' + t("Back") + '" title="' + t("Back") + '" onclick="' + backOnclick + '">←</button><strong class="comment-nav-title">' + t("Post") + '</strong><a class="comment-root-link" href="' + escHtml(location.origin + rootHref) + '" onclick="return openPostLink(event, ' + rootId + ', ' + rootHandleArg + ')">' + t("View post") + '</a></div>';
+  if (isCommentHidden(c.id)) {
+    return nav + '<article class="panel post comment-detail"><div class="comment-hidden"><div class="tiny muted">' + t("Hidden reply") + '</div><button class="comment-hide-btn" onclick="showCommentForMe(' + c.id + ')">' + t("Show") + '</button></div></article>';
+  }
+  // Full ancestor chain (X model): the root post on top, then every
+  // ancestor root-first, then the focused comment.
+  const chain = [postCompactHtml(rootPost)];
+  for (const a of (ancestors || [])) chain.push(commentCompactHtml(a, rootId));
+  const parentHtml = chain.join("");
+  const focusedTime = '<div class="comment-focused-meta"><a class="comment-permalink comment-absolute-time" href="' + escHtml(commentPermalink(c)) + '" onclick="return openCommentLink(event, ' + c.id + ', ' + commentJsHandle(c) + ', ' + rootId + ')">' + fmtXTime(c.ts) + '</a><span class="comment-focused-views"> · ' + fmtCompact(c.viewCount || 0) + ' ' + t("Views") + '</span><button class="comment-hide-btn" onclick="hideCommentForMe(' + c.id + ')">' + t("Hide") + '</button></div>';
+  const focused = '<div class="comment-focused">' + postHeadHtml(c) + '<div class="post-body">' + linkify(c.text) + '</div>' + focusedTime + commentActionBarHtml(c, rootId, true) + '</div>';
+  const repliesHtml = repliesFailed
+    ? '<div class="tiny muted">' + t("Replies could not be loaded.") + ' <button class="comment-hide-btn" onclick="loadCommentDetail()">' + t("Retry") + '</button></div>'
+    : (replies.length ? replies.map((r) => replyItemHtml(r, { id: rootId, handle: rootHandle }, true)).join("") : '<div class="tiny muted">' + t("No replies yet.") + '</div>');
+  const toggle = hiddenRepliesToggleHtml(replies);
+  const showMore = repliesHasMore ? '<div style="margin-top:10px"><button class="btn btn-small" id="comment-show-more" onclick="loadMoreCommentReplies(this)">' + t("Show more") + '</button></div>' : '';
+  return nav + '<article class="panel post comment-detail"><div class="conversation"><div class="thread-line"></div>' + parentHtml + focused + '</div></article>'
+    + '<div class="panel post" id="comment-replies-panel" style="margin-top:14px">' + toggle + '<div class="comments" style="display:block">' + repliesHtml + '</div>' + showMore + '</div>';
+}
+async function loadCommentDetail() {
+  const box = $("comment-detail");
+  if (!box) return;
+  if (!currentCommentId || !currentPostId) { box.innerHTML = '<div class="panel post"><div class="post-body">' + t("This reply could not be found.") + '</div></div>'; return; }
+  box.innerHTML = '<div class="tiny muted">' + t("Loading...") + '</div>';
+  commentRepliesShown = 0; commentRepliesTotal = 0;
+  try {
+    const results = await Promise.allSettled([
+      fetch("/api/social/comments/" + currentCommentId + "?postId=" + currentPostId),
+      fetch("/api/social/comments/" + currentCommentId + "/replies?limit=3&offset=0"),
+    ]);
+    const cres = results[0].status === "fulfilled" ? results[0].value : null;
+    const rres = results[1].status === "fulfilled" ? results[1].value : null;
+    if (!cres || cres.status === 404) {
+      box.innerHTML = '<div class="panel post"><div class="post-body">' + t("This reply could not be found.") + '</div></div>';
+      return;
+    }
+    if (!cres.ok) throw new Error("load_failed");
+    const data = await cres.json();
+    const c = data.comment, parent = data.parentComment || null, ancestors = data.ancestors || [], rootPost = data.rootPost;
+    currentCommentId = c.id;
+    currentPostId = c.postId;
+    currentCommentData = { comment: c, parentComment: parent, rootPost };
+    if (c.handle && currentView === "comment") {
+      try { history.replaceState(null, "", canonicalCommentPath(c.handle, c.postId, c.id)); } catch (e) {}
+    }
+    try { document.title = (c.handle || "Reply") + " on Social Agent: " + String(c.text || "").slice(0, 60); } catch (e) {}
+    let replies = [], repliesTotal = 0, repliesHasMore = false, repliesFailed = false;
+    if (rres && rres.ok) {
+      const rdata = await rres.json().catch(() => ({}));
+      replies = rdata.replies || [];
+      repliesTotal = rdata.total || 0;
+      repliesHasMore = !!rdata.hasMore;
+    } else {
+      repliesFailed = true;
+    }
+    commentRepliesShown = replies.length;
+    commentRepliesTotal = repliesTotal;
+    box.innerHTML = commentDetailHtml(c, parent, ancestors, rootPost, replies, repliesTotal, repliesHasMore, repliesFailed);
+    await refreshCommentReactions([c.id, ...ancestors.map((a) => a.id), ...replies.map((r) => r.id)]);
+    if (rootPost && rootPost.id) await refreshReactions([rootPost.id]);
+    positionThreadLine();
+  } catch (e) {
+    box.innerHTML = '<div class="panel post" onclick="loadCommentDetail()" style="cursor:pointer"><div class="post-body">' + t("Could not load this reply. Tap to try again.") + '</div></div>';
+  }
+}
+async function loadMoreCommentReplies(btn) {
+  if (!currentCommentId) return;
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch("/api/social/comments/" + currentCommentId + "/replies?limit=50&offset=" + commentRepliesShown);
+    const data = await res.json().catch(() => ({}));
+    const more = data.replies || [];
+    const panel = $("comment-replies-panel");
+    const list = panel ? panel.querySelector(".comments") : null;
+    if (list) {
+      const rootHandle = currentCommentData && currentCommentData.rootPost ? currentCommentData.rootPost.handle : null;
+      list.insertAdjacentHTML("beforeend", more.map((r) => replyItemHtml(r, { id: currentPostId, handle: rootHandle }, true)).join(""));
+      await refreshCommentReactions(more.map((r) => r.id));
+    }
+    commentRepliesShown += more.length;
+    commentRepliesTotal = data.total || commentRepliesTotal;
+    if (btn) {
+      if (!data.hasMore) btn.remove();
+      else btn.disabled = false;
+    }
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    toast(t("Could not load replies."));
+  }
 }
 
 async function deletePost(id, btn) {
@@ -1928,12 +2649,15 @@ document.querySelectorAll("#profile-tabs .tab").forEach((t) => t.addEventListene
 (function init() {
   const route = parseRoute();
   initLang();
+  wireSearchInput($("search-input"));
+  wireSearchInput($("topbar-search"));
   renderPairUI();
   renderNftHome();
   refreshPairingPill();
   if (route.code) pendingCrewCode = extractCode(route.code);
   restoreSession().finally(async () => {
     if (route.page === "post") { currentPostId = route.postId; navigate("post", route.postHandle ? false : "/post/" + route.postId); return; }
+    if (route.page === "comment") { currentPostId = route.postId; currentCommentId = route.commentId; navigate("comment", false); return; }
     if (route.page === "profile" && route.profileHandle) {
       const addr = await resolveHandleToAddress(route.profileHandle);
       if (addr) { profileAddr = addr; navigate("profile", canonicalProfilePath(route.profileHandle)); }
